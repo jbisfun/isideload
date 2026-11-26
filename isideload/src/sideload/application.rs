@@ -22,6 +22,37 @@ use std::path::PathBuf;
 use tracing::{info, warn};
 use zip::ZipArchive;
 
+/// Unpacks `archive` under `dest` through `isideload_vfs`. `ZipArchive::extract`
+/// writes with `std::fs`, which is unavailable on wasm.
+fn extract_to_vfs<R: std::io::Read + std::io::Seek>(
+    archive: &mut ZipArchive<R>,
+    dest: &std::path::Path,
+) -> std::io::Result<()> {
+    for i in 0..archive.len() {
+        let mut entry = archive.by_index(i)?;
+        let Some(rel) = entry.enclosed_name() else {
+            continue;
+        };
+        let out = dest.join(rel);
+        if entry.is_dir() {
+            isideload_vfs::fs::create_dir_all(&out)?;
+            continue;
+        }
+        if let Some(parent) = out.parent() {
+            isideload_vfs::fs::create_dir_all(parent)?;
+        }
+        let mut contents = Vec::with_capacity(entry.size() as usize);
+        std::io::Read::read_to_end(&mut entry, &mut contents)?;
+        if entry.is_symlink() {
+            let target = String::from_utf8_lossy(&contents).into_owned();
+            isideload_vfs::fs::symlink(target, &out)?;
+        } else {
+            isideload_vfs::fs::write(&out, &contents)?;
+        }
+    }
+    Ok(())
+}
+
 static ALT_PAIRING_FILE: &str = "ALTPairingFile.dat";
 
 pub struct Application {
@@ -60,12 +91,11 @@ impl Application {
             let mut archive =
                 ZipArchive::new(file).context("Failed to open application archive")?;
 
-            archive
-                .extract(&temp_path)
+            extract_to_vfs(&mut archive, &temp_path)
                 .context("Failed to extract application archive")?;
 
             let payload_folder = temp_path.join("Payload");
-            if isideload_vfs::fs::metadata(&payload_folder).is_ok() && payload_folder.is_dir() {
+            if isideload_vfs::fs::metadata(&payload_folder).is_ok_and(|m| m.is_dir()) {
                 let app_dirs: Vec<_> = isideload_vfs::fs::read_dir(&payload_folder)
                     .context("Failed to read Payload directory")?
                     .filter_map(Result::ok)
@@ -86,7 +116,7 @@ impl Application {
             } else {
                 // gather the directory contents as a string for debugging
                 let mut contents = String::new();
-                if isideload_vfs::fs::metadata(&temp_path).is_ok() && temp_path.is_dir() {
+                if isideload_vfs::fs::metadata(&temp_path).is_ok_and(|m| m.is_dir()) {
                     let entries = isideload_vfs::fs::read_dir(&temp_path)
                         .context("Failed to read temporary directory for error reporting")?;
                     for entry in entries {
